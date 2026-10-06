@@ -1,0 +1,758 @@
+
+(() => {
+'use strict';
+
+const PLAYLIST_ID = 'PLVbc8DqsLqEYywbRnDeZSUV5gr2LmyzzN';
+const RM = matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+const $ = (s, r = document) => r.querySelector(s);
+const root = document.documentElement;
+const stage = $('#stage'), bg = $('#bg'), layer = $('#player-layer'), shell = $('#player-shell'), glass = $('#glass');
+const notice = $('#notice'), toastEl = $('#toast'), live = $('#live'), probe = $('#safe-probe');
+const infoEls = [...document.querySelectorAll('.info')];
+const transportEl = $('.transport'), seekEl = $('.seek'), curEl = $('.time.cur'), durEl = $('.time.dur');
+const playBtn = $('.tbtn.play'), soundBtn = $('.tbtn.sound');
+const prevBtn = $('.nav.prev'), nextBtn = $('.nav.next');
+
+if (!('drawElementImage' in CanvasRenderingContext2D.prototype)) {
+  notice.innerHTML = '<b>HTML-in-Canvas 필요</b>이 페이지는 실험 기능 <code>drawElementImage</code>로 그려집니다.<br>Chrome Canary에서 <code>chrome://flags/#canvas-draw-element</code>를 켜고 다시 열어 주세요.';
+  return;
+}
+if (location.protocol === 'file:') {
+  notice.innerHTML = '<b>Velvet Room</b>YouTube 임베드는 <code>file://</code>에서 재생되지 않습니다.<br><code>npx serve</code> 같은 로컬 서버로 열어 주세요.';
+}
+
+const sctx = stage.getContext('2d');
+const bctx = bg.getContext('2d');
+
+const ICON = {
+  play:  '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 4.5v15l13-7.5z" fill="currentColor"/></svg>',
+  pause: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6.5 4.5h4v15h-4zM13.5 4.5h4v15h-4z" fill="currentColor"/></svg>',
+  on:    '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3.5 9h4l5-4v14l-5-4h-4z" fill="currentColor"/><path d="M15.5 8.5a5 5 0 0 1 0 7M18 6a8.5 8.5 0 0 1 0 12" fill="none" stroke="currentColor" stroke-width="1.8"/></svg>',
+  off:   '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3.5 9h4l5-4v14l-5-4h-4z" fill="currentColor"/><path d="M16 9.5l5 5M21 9.5l-5 5" fill="none" stroke="currentColor" stroke-width="1.8"/></svg>'
+};
+
+/* ── state ─────────────────────────────────────────────── */
+const S = {
+  ids: [], n: 0, cardEls: [], thumbs: [], colors: [], meta: [],
+  pos: 0, vel: 0, target: 0, dragging: false,
+  center: -1, loaded: -1, loadT: 0, playerReady: false, errored: false, errStreak: 0,
+  playing: false, muted: true, activated: false, seeking: false,
+  shownAlpha: 0, accentNow: [232, 39, 75], accentTarget: [232, 39, 75],
+  info: { active: 0, t0: -1e9, idx: -1 },
+  px: -1e4, py: -1e4, mouse: false,
+  now: performance.now(), dirty: true, lastPaint: 0
+};
+const mag = { prev: { x: 0, y: 0 }, next: { x: 0, y: 0 } };
+const L = {};
+
+/* ── utils ─────────────────────────────────────────────── */
+const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
+const mod = (a, n) => ((a % n) + n) % n;
+const wrapOff = d => mod(d + S.n / 2, S.n) - S.n / 2;
+const pad = n => String(n).padStart(2, '0');
+const easeInOut = t => t < .5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+const rgbStr = c => `${c[0] | 0},${c[1] | 0},${c[2] | 0}`;
+const fmt = s => {
+  s = Math.max(0, Math.floor(s || 0));
+  const h = Math.floor(s / 3600), m = Math.floor(s / 60) % 60, x = s % 60;
+  return h ? `${h}:${pad(m)}:${pad(x)}` : `${m}:${pad(x)}`;
+};
+const setText = (el, t) => { if (el.textContent !== t) el.textContent = t; };
+
+function hslToRgb(h, s, l) {
+  const k = n => (n + h / 30) % 12, a = s * Math.min(l, 1 - l);
+  const f = n => l - a * Math.max(-1, Math.min(k(n) - 3, Math.min(9 - k(n), 1)));
+  return [f(0) * 255, f(8) * 255, f(4) * 255];
+}
+function rgbToHsl(r, g, b) {
+  r /= 255; g /= 255; b /= 255;
+  const mx = Math.max(r, g, b), mn = Math.min(r, g, b), l = (mx + mn) / 2;
+  if (mx === mn) return [0, 0, l];
+  const d = mx - mn, s = l > .5 ? d / (2 - mx - mn) : d / (mx + mn);
+  let h = mx === r ? (g - b) / d + (g < b ? 6 : 0) : mx === g ? (b - r) / d + 2 : (r - g) / d + 4;
+  return [h * 60, s, l];
+}
+function hashColor(id) {
+  let h = 0; for (const ch of String(id)) h = (h * 31 + ch.charCodeAt(0)) >>> 0;
+  return hslToRgb(h % 360, .72, .56);
+}
+const colorOf = i => S.colors[i] || hashColor(S.ids[i]);
+const mixRgb = (a, b, t) => [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
+
+let toastTimer = 0;
+function toast(msg) {
+  toastEl.textContent = msg; toastEl.classList.add('show');
+  clearTimeout(toastTimer); toastTimer = setTimeout(() => toastEl.classList.remove('show'), 2800);
+}
+function fail(msg) {
+  notice.innerHTML = `<b>재생할 수 없음</b>${msg}`;
+  notice.classList.remove('hide');
+}
+
+/* ── layout ────────────────────────────────────────────── */
+function layout() {
+  const W = innerWidth, H = innerHeight, dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const cs = getComputedStyle(probe);
+  const sa = { t: parseFloat(cs.paddingTop) || 0, r: parseFloat(cs.paddingRight) || 0, b: parseFloat(cs.paddingBottom) || 0, l: parseFloat(cs.paddingLeft) || 0 };
+  const mobile = W < 760 || H > W * 1.15;
+  const cw = mobile ? Math.min(W - 32 - sa.l - sa.r, 720) : Math.min(W * .56, H * .56 * 16 / 9, 1120);
+  const ch = cw * 9 / 16;
+  const oy = mobile ? Math.max(sa.t + 28 + ch / 2, H * .3) : H * .42;
+
+  Object.assign(L, {
+    W, H, dpr, mobile, cw, ch, ox: W / 2, oy,
+    P: Math.max(W, 900) * 1.3,
+    gap1: cw * (mobile ? .7 : .6), gap2: cw * .17,
+    maxRot: RM ? 0 : 52 * Math.PI / 180,
+    nav: mobile ? 56 : 64
+  });
+
+  const cardL = L.ox - cw / 2, cardB = oy + ch / 2;
+  let avail;
+  if (mobile) {
+    L.navY = H - sa.b - 20 - L.nav;
+    L.prevX = 16 + sa.l; L.nextX = W - 16 - sa.r - L.nav;
+    L.tw = W - 32 - sa.l - sa.r; L.tx = 16 + sa.l; L.ty = L.navY - 14 - 48;
+    L.iw = L.tw + 20; L.ix = L.tx - 10; L.iy = cardB + 12;
+    avail = L.ty - L.iy - 8;
+  } else {
+    L.navY = oy - L.nav / 2;
+    L.prevX = 24 + sa.l; L.nextX = W - 24 - sa.r - L.nav;
+    L.tw = Math.min(400, cw * .42); L.tx = cardL + cw - L.tw; L.ty = cardB + 24;
+    L.iw = cw - L.tw - 8; L.ix = cardL - 10; L.iy = cardB + 14;
+    avail = H - sa.b - L.iy - 16;
+  }
+  const num = clamp(avail * .42, 48, mobile ? 96 : 128);
+  const tsize = clamp(avail * .12, 18, mobile ? 26 : 34);
+
+  root.style.setProperty('--cw', cw + 'px');
+  root.style.setProperty('--ch', ch + 'px');
+  root.style.setProperty('--iw', L.iw + 'px');
+  root.style.setProperty('--tw', L.tw + 'px');
+  root.style.setProperty('--nav', L.nav + 'px');
+  root.style.setProperty('--num', num + 'px');
+  root.style.setProperty('--tsize', tsize + 'px');
+
+  stage.width = Math.round(W * dpr); stage.height = Math.round(H * dpr);
+  bg.width = Math.max(1, Math.ceil(W / 6)); bg.height = Math.max(1, Math.ceil(H / 6));
+
+  layer.style.perspective = L.P + 'px';
+  layer.style.perspectiveOrigin = `${L.ox}px ${oy}px`;
+  Object.assign(shell.style, { left: cardL + 'px', top: (oy - ch / 2) + 'px', width: cw + 'px', height: ch + 'px' });
+  S.dirty = true;
+}
+
+/* ── 3D pose shared by canvas strips and the CSS-3D iframe ── */
+function poseFor(o) {
+  const a = Math.abs(o), s = Math.sign(o), m = Math.min(a, 1);
+  return {
+    x: s * (a <= 1 ? a * L.gap1 : L.gap1 + (a - 1) * L.gap2),
+    z: -(m * L.cw * .42 + Math.max(0, a - 1) * L.cw * .1),
+    th: s * Math.sin(m * Math.PI / 2) * L.maxRot,
+    alpha: a < 2.4 ? 1 : Math.max(0, 1 - (a - 2.4)),
+    dim: Math.min(.6, m * .42 + Math.max(0, a - 1) * .08)
+  };
+}
+// CSS: rotateY(θ) maps (u,0,0) → (u·cosθ, 0, −u·sinθ); perspective(P) scales by P/(P−z).
+function proj(p, u) {
+  const X = p.x + u * Math.cos(p.th), Z = p.z - u * Math.sin(p.th), k = L.P / (L.P - Z);
+  return [L.ox + X * k, k];
+}
+
+/* ── drawElementImage wrapper ─────────────────────────── */
+let optsOK = true;
+function drawEl(el, x, y, w, h, preserve) {
+  try {
+    const r = optsOK
+      ? sctx.drawElementImage(el, x, y, w, h, { preserveElementGeometry: !!preserve })
+      : sctx.drawElementImage(el, x, y, w, h);
+    // Origin-trial builds return a DOMMatrix to sync hit testing; current builds update geometry themselves.
+    if (!preserve && r && typeof DOMMatrixReadOnly !== 'undefined' && r instanceof DOMMatrixReadOnly) {
+      const t = r.toString(); if (el.style.transform !== t) el.style.transform = t;
+    }
+  } catch (err) {
+    if (optsOK && err instanceof TypeError) { optsOK = false; drawEl(el, x, y, w, h, preserve); }
+    // otherwise: no snapshot yet for a freshly inserted element — next paint will have it
+  }
+}
+function pathPoly(pts) {
+  sctx.beginPath(); sctx.moveTo(pts[0][0], pts[0][1]);
+  for (let i = 1; i < pts.length; i++) sctx.lineTo(pts[i][0], pts[i][1]);
+  sctx.closePath();
+}
+
+/* ── stage render (runs inside the canvas `paint` event) ── */
+function render(now) {
+  S.lastPaint = performance.now();
+  if (sctx.reset) sctx.reset(); else { sctx.setTransform(1, 0, 0, 1, 0, 0); sctx.clearRect(0, 0, stage.width, stage.height); }
+  if (!S.n) return;
+  sctx.setTransform(L.dpr, 0, 0, L.dpr, 0, 0);
+
+  drawSlab();
+  const list = [];
+  for (let i = 0; i < S.n; i++) {
+    const o = wrapOff(i - S.pos);
+    if (Math.abs(o) < 3.45) list.push([i, o]);
+  }
+  list.sort((a, b) => Math.abs(b[1]) - Math.abs(a[1]));
+  for (const [i, o] of list) drawCard(i, o);
+
+  drawInfo(now);
+  drawEl(transportEl, L.tx, L.ty, transportEl.offsetWidth, transportEl.offsetHeight, false);
+  drawEl(prevBtn, L.prevX + mag.prev.x, L.navY + mag.prev.y, L.nav, L.nav, false);
+  drawEl(nextBtn, L.nextX + mag.next.x, L.navY + mag.next.y, L.nav, L.nav, false);
+}
+
+// Hard-edged accent slab behind the centred card, following its perspective.
+function drawSlab() {
+  const o = wrapOff(Math.round(S.pos) - S.pos);
+  const strength = clamp(1 - Math.abs(o) * 1.8, 0, 1);
+  if (strength <= 0) return;
+  const p = poseFor(o), w = L.cw, h = L.ch;
+  const [l, kl] = proj(p, -w / 2), [r, kr] = proj(p, w / 2);
+  const d = L.cw * .022;
+  sctx.save();
+  sctx.globalAlpha = strength;
+  sctx.fillStyle = `rgb(${rgbStr(S.accentNow)})`;
+  pathPoly([[l + d * 1.6, L.oy - h / 2 * kl + d], [r + d, L.oy - h / 2 * kr + d], [r + d * .4, L.oy + h / 2 * kr + d], [l + d, L.oy + h / 2 * kl + d]]);
+  sctx.fill();
+  sctx.restore();
+}
+
+function drawCard(i, o) {
+  const p = poseFor(o);
+  if (p.alpha <= .01) return;
+  const w = L.cw, h = L.ch, el = S.cardEls[i];
+  if (!S.thumbs[i]) loadThumb(i);
+  const t = S.thumbs[i];
+  const N = Math.abs(p.th) < .004 ? 1 : clamp(Math.ceil(Math.abs(Math.sin(p.th)) * w / 9), 6, 56);
+  const snap = v => Math.round(v * L.dpr) / L.dpr;
+
+  sctx.globalAlpha = p.alpha;
+  let [sxPrev, kPrev] = proj(p, -w / 2);
+  sxPrev = snap(sxPrev);
+  for (let s = 0; s < N; s++) {
+    const u0 = -w / 2 + w * s / N, u1 = -w / 2 + w * (s + 1) / N;
+    let [sx1, k1] = proj(p, u1);
+    sx1 = snap(sx1);
+    const sx0 = sxPrev, km = (kPrev + k1) / 2;
+    const top = L.oy - h / 2 * km, hh = h * km, dw = sx1 - sx0;
+    if (dw > 0) {
+      if (t && t.ok) sctx.drawImage(t.img, t.sx + t.sw * s / N, t.sy, t.sw / N, t.sh, sx0, top, dw, hh);
+      else { sctx.fillStyle = '#101a5c'; sctx.fillRect(sx0, top, dw, hh); }
+
+      if (N === 1) drawEl(el, sx0, top, dw, hh, true);
+      else {
+        // One vertical strip of the live HTML card, scaled for its depth (piecewise perspective).
+        const scx = dw / (u1 - u0);
+        sctx.save();
+        sctx.beginPath(); sctx.rect(sx0, top - 2, dw, hh + 4); sctx.clip();
+        drawEl(el, sx0 - (u0 + w / 2) * scx, top, w * scx, hh, true);
+        sctx.restore();
+      }
+      if (p.dim > .01) { sctx.fillStyle = `rgba(6,10,38,${p.dim})`; sctx.fillRect(sx0, top, dw, hh); }
+    }
+    sxPrev = sx1; kPrev = k1;
+  }
+  sctx.globalAlpha = 1;
+}
+
+// Slash transition between the outgoing and incoming title panels.
+function drawInfo(now) {
+  const inEl = infoEls[S.info.active], outEl = infoEls[1 - S.info.active];
+  const x = L.ix, y = L.iy;
+  const wIn = inEl.offsetWidth, hIn = inEl.offsetHeight, wOut = outEl.offsetWidth, hOut = outEl.offsetHeight;
+  const p = clamp((now - S.info.t0) / (RM ? 260 : 640), 0, 1);
+  if (p >= 1) { drawEl(inEl, x, y, wIn, hIn, true); return; }
+  S.dirty = true;
+
+  if (RM) {
+    sctx.globalAlpha = 1 - p; drawEl(outEl, x, y, wOut, hOut, true);
+    sctx.globalAlpha = p; drawEl(inEl, x, y, wIn, hIn, true);
+    sctx.globalAlpha = 1; return;
+  }
+
+  const e = easeInOut(p);
+  const w = Math.max(wIn, wOut), h = Math.max(hIn, hOut) + 20, top = y - 10;
+  const slant = h * .42;
+  const fx = x - slant - 30 + e * (w + slant + 60);
+  const far = 600;
+
+  // Outgoing: cut along a rising diagonal, the halves slide apart along the cut.
+  const c1 = [x, y + hOut * .7], c2 = [x + wOut, y + hOut * .35];
+  const dx = c2[0] - c1[0], dy = c2[1] - c1[1], len = Math.hypot(dx, dy) || 1, ux = dx / len, uy = dy / len;
+  const e1 = [c1[0] - ux * far, c1[1] - uy * far], e2 = [c2[0] + ux * far, c2[1] + uy * far];
+  const slide = e * 46, fade = Math.pow(1 - e, 1.4);
+  sctx.save();
+  pathPoly([[fx + slant, top - far], [x + w + far, top - far], [x + w + far, top + h + far], [fx, top + h + far]]);
+  sctx.clip();
+  sctx.globalAlpha = fade;
+  sctx.save(); pathPoly([e1, e2, [e2[0], e2[1] - far * 2], [e1[0], e1[1] - far * 2]]); sctx.clip();
+  drawEl(outEl, x + ux * slide, y + uy * slide - e * 6, wOut, hOut, true); sctx.restore();
+  sctx.save(); pathPoly([e1, e2, [e2[0], e2[1] + far * 2], [e1[0], e1[1] + far * 2]]); sctx.clip();
+  drawEl(outEl, x - ux * slide, y - uy * slide + e * 6, wOut, hOut, true); sctx.restore();
+  sctx.globalAlpha = Math.max(0, 1 - p * 2.4);
+  sctx.strokeStyle = '#eef1ff'; sctx.lineWidth = 1.5;
+  sctx.beginPath(); sctx.moveTo(c1[0] - ux * 40, c1[1] - uy * 40); sctx.lineTo(c2[0] + ux * 40, c2[1] + uy * 40); sctx.stroke();
+  sctx.restore();
+
+  // Incoming: wiped in behind the moving front.
+  sctx.save();
+  pathPoly([[x - far, top - far], [fx + slant, top - far], [fx, top + h + far], [x - far, top + h + far]]);
+  sctx.clip();
+  drawEl(inEl, x - (1 - e) * 28, y, wIn, hIn, true);
+  sctx.restore();
+
+  // The blade.
+  sctx.save();
+  sctx.globalAlpha = Math.sin(Math.PI * p);
+  sctx.fillStyle = `rgb(${rgbStr(S.accentNow)})`;
+  pathPoly([[fx + slant, top], [fx + slant + 9, top], [fx + 9, top + h], [fx, top + h]]); sctx.fill();
+  sctx.fillStyle = '#eef1ff';
+  pathPoly([[fx + slant + 16, top], [fx + slant + 18, top], [fx + 18, top + h], [fx + 16, top + h]]); sctx.fill();
+  sctx.restore();
+}
+
+stage.addEventListener('paint', () => render(S.now));
+
+/* ── background (plain canvas, low-res, scrubbed by position) ── */
+function drawCover(rec, alpha, offX, t) {
+  if (!rec || !rec.ok || alpha <= .003) return;
+  const bw = bg.width, bh = bg.height;
+  const s = Math.max(bw / rec.sw, bh / rec.sh) * (1.22 + .04 * Math.sin(t * .21));
+  const dw = rec.sw * s, dh = rec.sh * s;
+  bctx.globalAlpha = alpha;
+  bctx.drawImage(rec.img, rec.sx, rec.sy, rec.sw, rec.sh,
+    (bw - dw) / 2 + offX + Math.sin(t * .13) * bw * .02,
+    (bh - dh) / 2 + Math.cos(t * .11) * bh * .02, dw, dh);
+}
+function drawBg(now) {
+  const bw = bg.width, bh = bg.height, t = now / 1000;
+  bctx.globalCompositeOperation = 'source-over'; bctx.globalAlpha = 1; bctx.filter = 'none';
+  bctx.fillStyle = '#0b1446'; bctx.fillRect(0, 0, bw, bh);
+  if (!S.n) return;
+  const i0 = Math.floor(S.pos), f = S.pos - i0, a = mod(i0, S.n), c = mod(i0 + 1, S.n);
+  bctx.filter = 'blur(4px) saturate(1.4)';
+  drawCover(S.thumbs[a], 1, -f * bw * .14, t);
+  drawCover(S.thumbs[c], f, (1 - f) * bw * .14, t);
+  bctx.filter = 'none'; bctx.globalAlpha = 1;
+  bctx.globalCompositeOperation = 'multiply';
+  bctx.fillStyle = '#4a5fd8'; bctx.fillRect(0, 0, bw, bh);
+  bctx.globalCompositeOperation = 'screen';
+  const col = rgbStr(mixRgb(colorOf(a), colorOf(c), f));
+  const gx = bw / 2, gy = L.oy / L.H * bh;
+  const g = bctx.createRadialGradient(gx, gy, 0, gx, gy, bw * .58);
+  g.addColorStop(0, `rgba(${col},.5)`); g.addColorStop(1, `rgba(${col},0)`);
+  bctx.fillStyle = g; bctx.fillRect(0, 0, bw, bh);
+  bctx.globalCompositeOperation = 'source-over';
+}
+
+/* ── live player layer ─────────────────────────────────── */
+function updateShell(dt) {
+  if (S.loaded < 0) return;
+  const o = wrapOff(S.loaded - S.pos), p = poseFor(o);
+  const vis = S.playerReady ? clamp(1 - (Math.abs(o) - .12) / .45, 0, 1) : 0;
+  S.shownAlpha += (vis - S.shownAlpha) * (1 - Math.exp(-dt * 14));
+  if (Math.abs(S.shownAlpha - vis) < .002) S.shownAlpha = vis;
+  shell.style.transform = `translate3d(${p.x.toFixed(2)}px,0,${p.z.toFixed(2)}px) rotateY(${p.th.toFixed(5)}rad)`;
+  shell.style.opacity = S.shownAlpha.toFixed(3);
+  shell.classList.toggle('live', S.shownAlpha > .5);
+}
+
+/* ── data: thumbnails, colours, titles ─────────────────── */
+function loadThumb(i) {
+  if (S.thumbs[i]) return;
+  const rec = { ok: false }; S.thumbs[i] = rec;
+  const id = S.ids[i];
+  const tries = [['maxresdefault', true], ['hqdefault', true], ['maxresdefault', false], ['hqdefault', false]];
+  let k = 0;
+  const attempt = () => {
+    if (k >= tries.length) return;
+    const [name, cors] = tries[k++];
+    const img = new Image();
+    if (cors) img.crossOrigin = 'anonymous';
+    img.onload = () => {
+      if (img.naturalWidth <= 120) return attempt();
+      const W0 = img.naturalWidth, H0 = img.naturalHeight, th = W0 * 9 / 16;
+      Object.assign(rec, { img, cors, sx: 0, sw: W0, sy: H0 > th + 2 ? (H0 - th) / 2 : 0, sh: H0 > th + 2 ? th : H0, ok: true });
+      extractColor(i, rec);
+      S.dirty = true;
+    };
+    img.onerror = attempt;
+    img.src = `https://i.ytimg.com/vi/${id}/${name}.jpg`;
+  };
+  attempt();
+}
+
+function extractColor(i, rec) {
+  let col = null;
+  if (rec.cors) {
+    try {
+      const cv = document.createElement('canvas'); cv.width = 40; cv.height = 22;
+      const x = cv.getContext('2d', { willReadFrequently: true });
+      x.drawImage(rec.img, rec.sx, rec.sy, rec.sw, rec.sh, 0, 0, 40, 22);
+      const d = x.getImageData(0, 0, 40, 22).data;
+      const bins = Array.from({ length: 24 }, () => ({ w: 0, s: 0, l: 0 }));
+      for (let q = 0; q < d.length; q += 4) {
+        const [h, s, l] = rgbToHsl(d[q], d[q + 1], d[q + 2]);
+        const wgt = s * Math.max(0, 1 - Math.abs(l - .5) * 1.8);
+        const b = bins[Math.floor(h / 15) % 24];
+        b.w += wgt; b.s += s * wgt; b.l += l * wgt;
+      }
+      let best = 0;
+      for (let j = 1; j < 24; j++) if (bins[j].w > bins[best].w) best = j;
+      const B = bins[best];
+      if (B.w > 1.5) col = hslToRgb(best * 15 + 7.5, clamp(B.s / B.w, .58, .95), clamp(B.l / B.w, .5, .62));
+    } catch (_) { /* tainted — fall back */ }
+  }
+  S.colors[i] = col || hashColor(S.ids[i]);
+  if (i === S.center) applyAccent(i);
+}
+function applyAccent(i) {
+  S.accentTarget = colorOf(i);
+  root.style.setProperty('--accent', `rgb(${rgbStr(S.accentTarget)})`);
+}
+
+const titleOf = i => (S.meta[i] && S.meta[i].title) || '제목 불러오는 중';
+const authorOf = i => (S.meta[i] && S.meta[i].author) || '';
+function setMeta(i, title, author) {
+  const m = S.meta[i] || (S.meta[i] = {});
+  if (title) m.title = title;
+  if (author) m.author = author;
+  setText(S.cardEls[i].querySelector('.card-title'), titleOf(i));
+  if (i === S.info.idx) fillInfo(infoEls[S.info.active], i);
+  if (i === S.loaded) announce(i);
+}
+async function fetchMeta(i) {
+  if (S.meta[i] && (S.meta[i].title || S.meta[i].pending)) return;
+  S.meta[i] = Object.assign(S.meta[i] || {}, { pending: true });
+  const url = encodeURIComponent('https://www.youtube.com/watch?v=' + S.ids[i]);
+  for (const ep of [`https://www.youtube.com/oembed?format=json&url=${url}`, `https://noembed.com/embed?url=${url}`]) {
+    try {
+      const r = await fetch(ep);
+      if (!r.ok) continue;
+      const j = await r.json();
+      if (j && j.title) { setMeta(i, j.title, j.author_name); return; }
+    } catch (_) { /* try next endpoint */ }
+  }
+}
+async function fetchAllMeta(from) {
+  const order = [];
+  for (let d = 0; d <= S.n / 2; d++) { order.push(mod(from + d, S.n)); if (d) order.push(mod(from - d, S.n)); }
+  const queue = [...new Set(order)];
+  const worker = async () => { while (queue.length) await fetchMeta(queue.shift()); };
+  await Promise.all([worker(), worker(), worker()]);
+}
+
+/* ── DOM content ───────────────────────────────────────── */
+function buildCards() {
+  const frag = document.createDocumentFragment();
+  S.cardEls = S.ids.map((id, i) => {
+    const el = document.createElement('div');
+    el.className = 'card';
+    el.setAttribute('drawable', '');
+    el.setAttribute('aria-hidden', 'true');
+    el.innerHTML = `<div class="card-cap"><span class="card-no">${pad(i + 1)}</span><span class="card-title"></span></div>`;
+    el.querySelector('.card-title').textContent = titleOf(i);
+    frag.appendChild(el);
+    return el;
+  });
+  stage.appendChild(frag);
+}
+function fillInfo(el, i) {
+  setText(el.querySelector('.n'), pad(i + 1));
+  setText(el.querySelector('.of'), '/ ' + pad(S.n));
+  setText(el.querySelector('.info-title span'), titleOf(i));
+  setText(el.querySelector('.info-by'), authorOf(i));
+}
+function announce(i) {
+  live.textContent = `${i + 1}번째 곡, ${titleOf(i)}`;
+  if (S.meta[i] && S.meta[i].title) document.title = `${S.meta[i].title} — Velvet Room`;
+}
+function setCenter(c) {
+  if (S.center >= 0 && S.cardEls[S.center]) S.cardEls[S.center].classList.remove('is-center');
+  S.center = c;
+  S.cardEls[c].classList.add('is-center');
+  const inn = 1 - S.info.active;
+  fillInfo(infoEls[inn], c);
+  infoEls[inn].removeAttribute('aria-hidden');
+  infoEls[S.info.active].setAttribute('aria-hidden', 'true');
+  S.info.active = inn; S.info.t0 = S.now; S.info.idx = c;
+  applyAccent(c);
+  for (let d = -4; d <= 4; d++) loadThumb(mod(c + d, S.n));
+  S.dirty = true;
+}
+function setPlayIcon() {
+  playBtn.innerHTML = S.playing ? ICON.pause : ICON.play;
+  playBtn.setAttribute('aria-label', S.playing ? '일시정지' : '재생');
+}
+function setSoundIcon() {
+  soundBtn.innerHTML = S.muted ? ICON.off : ICON.on;
+  soundBtn.setAttribute('aria-label', S.muted ? '소리 켜기' : '소리 끄기');
+}
+
+/* ── YouTube player ────────────────────────────────────── */
+let player = null;
+const call = (fn, ...a) => { try { return player && player[fn] ? player[fn](...a) : undefined; } catch (_) { return undefined; } };
+
+window.onYouTubeIframeAPIReady = () => {
+  const vars = { listType: 'playlist', list: PLAYLIST_ID, autoplay: 0, controls: 0, disablekb: 1, fs: 0, iv_load_policy: 3, playsinline: 1, rel: 0, mute: 1 };
+  if (location.origin && location.origin !== 'null') vars.origin = location.origin;
+  player = new YT.Player('yt', {
+    width: '100%', height: '100%', playerVars: vars,
+    events: { onReady, onStateChange, onError }
+  });
+};
+function onReady() {
+  call('mute');
+  const t0 = performance.now(); let cued = false;
+  const tick = () => {
+    const ids = call('getPlaylist');
+    if (ids && ids.length) return start(ids);
+    if (!cued && performance.now() - t0 > 2500) { cued = true; call('cuePlaylist', { listType: 'playlist', list: PLAYLIST_ID }); }
+    if (performance.now() - t0 > 15000) return fail('재생목록을 읽지 못했습니다. 페이지를 http(s) 주소로 열었는지 확인해 주세요.');
+    setTimeout(tick, 200);
+  };
+  tick();
+}
+function start(ids) {
+  S.ids = ids.slice(); S.n = S.ids.length;
+  buildCards();
+  S.pos = RM ? 0 : -2.6; S.target = 0; S.vel = 0;
+  for (let d = -4; d <= 4; d++) loadThumb(mod(d, S.n));
+  fetchAllMeta(0);
+  setPlayIcon(); setSoundIcon();
+  notice.classList.add('hide');
+  loadIndex(0);
+  S.dirty = true;
+}
+function loadIndex(i) {
+  S.loaded = i; S.playerReady = false; S.errored = false; S.loadT = S.now;
+  call('loadVideoById', { videoId: S.ids[i] });
+  if (S.muted) call('mute'); else call('unMute');
+  seekEl.value = 0; seekEl.style.setProperty('--p', '0%');
+  setText(curEl, '0:00'); setText(durEl, '0:00');
+  announce(i);
+}
+function onStateChange(e) {
+  const st = e.data;
+  if (st === 1) {
+    S.playerReady = true; S.playing = true; S.errStreak = 0;
+    const d = call('getVideoData');
+    if (d && d.title && S.loaded >= 0) setMeta(S.loaded, d.title, d.author);
+  } else if (st === 2) S.playing = false;
+  else if (st === 0) { S.playing = false; goTo(1); }
+  setPlayIcon();
+}
+function onError() {
+  S.errored = true; S.playerReady = false; S.errStreak++;
+  toast(`${pad(S.loaded + 1)}번 영상은 외부 재생이 막혀 있어 다음 곡으로 넘어갑니다.`);
+  if (S.errStreak < S.n) setTimeout(() => goTo(1), 1600);
+}
+
+function goTo(d) {
+  if (!S.n || S.dragging || !d) return;
+  S.target = Math.round(S.target) + d;
+  S.dirty = true;
+}
+function togglePlay() {
+  if (S.loaded < 0) return;
+  if (S.playing) call('pauseVideo'); else call('playVideo');
+}
+function setMuted(m) {
+  S.muted = m;
+  if (m) call('mute'); else call('unMute');
+  setSoundIcon();
+}
+
+setInterval(() => {
+  if (!player || S.loaded < 0) return;
+  const cur = call('getCurrentTime') || 0, dur = call('getDuration') || 0;
+  if (!S.seeking) {
+    const v = dur ? Math.round(cur / dur * 1000) : 0;
+    if (+seekEl.value !== v) { seekEl.value = v; seekEl.style.setProperty('--p', v / 10 + '%'); }
+    setText(curEl, fmt(cur));
+  }
+  setText(durEl, fmt(dur));
+}, 250);
+
+/* ── input ─────────────────────────────────────────────── */
+prevBtn.addEventListener('click', () => goTo(-1));
+nextBtn.addEventListener('click', () => goTo(1));
+playBtn.addEventListener('click', togglePlay);
+soundBtn.addEventListener('click', () => setMuted(!S.muted));
+seekEl.addEventListener('input', () => {
+  S.seeking = true;
+  seekEl.style.setProperty('--p', seekEl.value / 10 + '%');
+  setText(curEl, fmt(seekEl.value / 1000 * (call('getDuration') || 0)));
+});
+seekEl.addEventListener('change', () => {
+  call('seekTo', seekEl.value / 1000 * (call('getDuration') || 0), true);
+  S.seeking = false;
+});
+
+// First real gesture lifts the muted-autoplay restriction.
+function activate(e) {
+  if (S.activated) return;
+  S.activated = true;
+  if (e && e.target && e.target.closest && e.target.closest('.sound')) return;
+  setMuted(false);
+}
+addEventListener('pointerup', activate, true);
+addEventListener('keydown', activate, true);
+
+function hitCard(px, py) {
+  const list = [];
+  for (let i = 0; i < S.n; i++) { const o = wrapOff(i - S.pos); if (Math.abs(o) < 3.45) list.push(o); }
+  list.sort((a, b) => Math.abs(a) - Math.abs(b));
+  for (const o of list) {
+    const p = poseFor(o), w = L.cw, h = L.ch;
+    const [l, kl] = proj(p, -w / 2), [r, kr] = proj(p, w / 2);
+    if (px < Math.min(l, r) || px > Math.max(l, r)) continue;
+    const k = kl + (kr - kl) * ((px - l) / ((r - l) || 1));
+    if (Math.abs(py - L.oy) <= h / 2 * k) return o;
+  }
+  return null;
+}
+
+let drag = null;
+function onDown(e) {
+  if (!S.n) return;
+  if (e.currentTarget !== glass && e.target.closest && e.target.closest('button, input')) return;
+  if (e.pointerType === 'mouse' && e.button !== 0) return;
+  drag = { id: e.pointerId, x0: e.clientX, y0: e.clientY, p0: S.pos, lx: e.clientX, lt: e.timeStamp, v: 0, moved: false, el: e.currentTarget };
+  try { e.currentTarget.setPointerCapture(e.pointerId); } catch (_) {}
+}
+function onMove(e) {
+  if (e.pointerType === 'mouse') { S.px = e.clientX; S.py = e.clientY; S.mouse = true; }
+  if (!drag || e.pointerId !== drag.id) return;
+  if (!drag.moved) {
+    const dx = e.clientX - drag.x0;
+    if (Math.abs(dx) < 7 || Math.abs(dx) < Math.abs(e.clientY - drag.y0)) return;
+    drag.moved = true; S.dragging = true; stage.classList.add('dragging');
+    drag.x0 = e.clientX; drag.p0 = S.pos; drag.lx = e.clientX; drag.lt = e.timeStamp;
+  }
+  S.pos = drag.p0 - (e.clientX - drag.x0) / L.gap1;
+  const dt = Math.max(1, e.timeStamp - drag.lt) / 1000;
+  drag.v = drag.v * .6 + (-(e.clientX - drag.lx) / L.gap1 / dt) * .4;
+  drag.lx = e.clientX; drag.lt = e.timeStamp;
+  S.dirty = true;
+}
+function onUp(e, cancelled) {
+  if (!drag || e.pointerId !== drag.id) return;
+  const d = drag; drag = null;
+  if (!d.moved) {
+    if (cancelled) return;
+    if (d.el === glass) return togglePlay();
+    const o = hitCard(e.clientX, e.clientY);
+    if (o === null) return;
+    if (Math.abs(o) > .5) goTo(Math.round(o)); else togglePlay();
+    return;
+  }
+  S.dragging = false; stage.classList.remove('dragging');
+  let v = e.timeStamp - d.lt > 90 ? d.v * .2 : d.v;
+  v = clamp(v, -12, 12);
+  const base = Math.round(S.pos);
+  S.target = clamp(Math.round(S.pos + v * .2), base - 3, base + 3);
+  S.vel = v;
+  S.dirty = true;
+}
+stage.addEventListener('pointerdown', onDown);
+glass.addEventListener('pointerdown', onDown);
+addEventListener('pointermove', onMove);
+addEventListener('pointerup', e => onUp(e, false));
+addEventListener('pointercancel', e => onUp(e, true));
+
+let wheelAcc = 0, wheelT = 0;
+addEventListener('wheel', e => {
+  const d = Math.abs(e.deltaX) > Math.abs(e.deltaY) ? e.deltaX : e.deltaY;
+  const now = performance.now();
+  if (now - wheelT > 260) wheelAcc = 0;
+  wheelAcc += d;
+  if (Math.abs(wheelAcc) > 70) { goTo(Math.sign(wheelAcc)); wheelAcc = -Math.sign(wheelAcc) * 400; }
+  wheelT = now;
+}, { passive: true });
+
+addEventListener('keydown', e => {
+  const tgt = e.target;
+  if (tgt && tgt.closest && tgt.closest('input')) return;
+  if (e.key === 'ArrowRight') { e.preventDefault(); goTo(1); }
+  else if (e.key === 'ArrowLeft') { e.preventDefault(); goTo(-1); }
+  else if (e.key === ' ' && !(tgt && tgt.closest && tgt.closest('button'))) { e.preventDefault(); togglePlay(); }
+  else if (e.key === 'm' || e.key === 'M') setMuted(!S.muted);
+});
+
+addEventListener('resize', layout);
+if (document.fonts) document.fonts.ready.then(() => { S.dirty = true; });
+
+/* ── frame loop ────────────────────────────────────────── */
+function updateMagnet(dt) {
+  const a = 1 - Math.exp(-dt * 12);
+  for (const [key, bx] of [['prev', L.prevX], ['next', L.nextX]]) {
+    let tx = 0, ty = 0;
+    if (S.mouse && !S.dragging) {
+      const dx = S.px - (bx + L.nav / 2), dy = S.py - (L.navY + L.nav / 2), dist = Math.hypot(dx, dy);
+      const f = dist < 150 ? (1 - dist / 150) * .35 : 0;
+      tx = dx * f; ty = dy * f;
+    }
+    const m = mag[key], nx = m.x + (tx - m.x) * a, ny = m.y + (ty - m.y) * a;
+    if (Math.abs(nx - m.x) + Math.abs(ny - m.y) > .02) S.dirty = true;
+    m.x = nx; m.y = ny;
+  }
+}
+
+let last = performance.now();
+function frame(now) {
+  const dt = clamp((now - last) / 1000, .001, .05);
+  last = now; S.now = now;
+
+  if (S.n) {
+    if (!S.dragging) {
+      const k = RM ? 420 : 165, c = RM ? 42 : 22;
+      if (Math.abs(S.pos - S.target) > .0004 || Math.abs(S.vel) > .0004) {
+        let rem = dt;
+        while (rem > 0) {
+          const h = Math.min(rem, 1 / 240);
+          S.vel += (-k * (S.pos - S.target) - c * S.vel) * h;
+          S.pos += S.vel * h;
+          rem -= h;
+        }
+        S.dirty = true;
+      } else {
+        if (S.pos !== S.target) { S.pos = S.target; S.dirty = true; }
+        S.vel = 0;
+      }
+    }
+    const c = mod(Math.round(S.pos), S.n);
+    if (c !== S.center) setCenter(c);
+    if (!S.dragging && Math.abs(S.pos - S.target) < .22) {
+      const t = mod(Math.round(S.target), S.n);
+      if (t !== S.loaded) loadIndex(t);
+    }
+    if (S.loaded >= 0 && !S.playerReady && !S.errored && now - S.loadT > 3200) S.playerReady = true;
+
+    const ac = S.accentNow, at = S.accentTarget, ka = 1 - Math.exp(-dt * 6);
+    if (Math.abs(ac[0] - at[0]) + Math.abs(ac[1] - at[1]) + Math.abs(ac[2] - at[2]) > 1) {
+      S.accentNow = mixRgb(ac, at, ka); S.dirty = true;
+    }
+    updateShell(dt);
+  }
+  updateMagnet(dt);
+  drawBg(now);
+
+  // The title banner's CSS sway animation must be re-snapshotted into the canvas every frame.
+  if (!RM) S.dirty = true;
+  if (S.dirty) { S.dirty = false; stage.requestPaint(); }
+  requestAnimationFrame(frame);
+}
+
+layout();
+setPlayIcon(); setSoundIcon();
+requestAnimationFrame(frame);
+
+const yt = document.createElement('script');
+yt.src = 'https://www.youtube.com/iframe_api';
+yt.onerror = () => fail('YouTube 플레이어 스크립트를 불러오지 못했습니다. 네트워크 연결을 확인해 주세요.');
+document.head.appendChild(yt);
+})();
